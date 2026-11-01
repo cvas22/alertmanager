@@ -95,7 +95,14 @@ func newNotifier(t *testing.T, cfg *MatrixConfig) *Notifier {
 
 func notifyOne(t *testing.T, n *Notifier) notify.NotifyVerdict {
 	t.Helper()
-	ctx := notify.WithGroupKey(context.Background(), "1")
+	return notifyAt(t, n, time.Time{})
+}
+
+// notifyAt sends a notification the way the pipeline does at the given
+// flush time, which stays the same for the retries of a notification.
+func notifyAt(t *testing.T, n *Notifier, now time.Time) notify.NotifyVerdict {
+	t.Helper()
+	ctx := notify.WithNow(notify.WithGroupKey(context.Background(), "1"), now)
 	return n.Notify(ctx, alert.New(model.Alert{
 		Labels:   model.LabelSet{"alertname": "DiskFull", "room": testRoomID},
 		StartsAt: time.Now(),
@@ -125,8 +132,9 @@ func TestMatrixSendsTheMessageToTheRoom(t *testing.T) {
 		MsgType:       MsgTypeNotice,
 	})
 
-	for range 2 {
-		verdict := notifyOne(t, n)
+	now := time.Now()
+	for i := range 2 {
+		verdict := notifyAt(t, n, now.Add(time.Duration(i)*time.Minute))
 		require.NoError(t, verdict.Err())
 	}
 
@@ -144,6 +152,41 @@ func TestMatrixSendsTheMessageToTheRoom(t *testing.T) {
 	}
 	// A homeserver drops a request that reuses a transaction id.
 	require.NotEqual(t, events[0].path, events[1].path)
+}
+
+func TestMatrixRetriesReuseTheTransactionID(t *testing.T) {
+	t.Parallel()
+	u, sent := homeserver(t, http.StatusOK, `{"event_id":"$event"}`)
+	n := newNotifier(t, &MatrixConfig{HomeserverURL: &amcommoncfg.URL{URL: u}, AccessToken: "secret"})
+
+	now := time.Now()
+	for range 2 {
+		require.NoError(t, notifyAt(t, n, now).Err())
+	}
+
+	events := sent()
+	require.Len(t, events, 2)
+	require.Equal(t, events[0].path, events[1].path)
+}
+
+func TestMatrixKeepsTheEncodedContentWithinTheLimit(t *testing.T) {
+	t.Parallel()
+	u, sent := homeserver(t, http.StatusOK, `{"event_id":"$event"}`)
+	// Quotes take two bytes once they are encoded.
+	n := newNotifier(t, &MatrixConfig{
+		HomeserverURL: &amcommoncfg.URL{URL: u},
+		AccessToken:   "secret",
+		HTMLMessage:   strings.Repeat(`"`, maxBodyBytes),
+		Message:       strings.Repeat(`"`, maxBodyBytes),
+	})
+	require.NoError(t, notifyOne(t, n).Err())
+
+	events := sent()
+	require.Len(t, events, 1)
+	require.NotContains(t, events[0].content, "formatted_body")
+	encoded, err := json.Marshal(events[0].content)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(encoded), maxContentBytes)
 }
 
 func TestMatrixSendsTheHTMLMessage(t *testing.T) {

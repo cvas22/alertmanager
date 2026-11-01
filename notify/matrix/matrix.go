@@ -18,7 +18,7 @@ package matrix
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -41,12 +41,15 @@ const (
 	// A Matrix event, including the envelope the homeserver adds, is
 	// limited to 65536 bytes, see
 	// https://spec.matrix.org/latest/client-server-api/#size-limits.
-	// The plain text body and the HTML body are sent in the same event and
-	// are each truncated to this size. JSON escaping can make them grow
-	// (quotes, newlines and control characters take two to six bytes), so
-	// 2 x 20000 bytes leaves room for that and for the envelope (sender,
-	// room ID, event ID, signatures and so on) to stay under the limit.
-	maxBodyBytes = 20000
+	// maxContentBytes is the size of the JSON content the notifier sends. It
+	// leaves room for the envelope (sender, room ID, event ID, signatures and
+	// so on) to stay under the limit.
+	maxContentBytes = 60000
+	// The plain text body and the HTML body are cut to this size before
+	// they are encoded, so a very long message is not encoded in full. JSON
+	// escaping can make them grow, so the encoded content is checked
+	// against maxContentBytes as well.
+	maxBodyBytes = 30000
 	// The size of an error response that is read is bounded too.
 	maxResponseBytes = 64 << 10
 )
@@ -128,22 +131,19 @@ func (n *Notifier) Notify(ctx context.Context, as ...*alert.Alert) notify.Notify
 	if err != nil {
 		return notify.Unrecoverable(err, notify.DefaultReason)
 	}
-	// Each attempt gets its own transaction id: a homeserver drops a request
-	// that reuses one, which would also drop a later notification that
-	// repeats an earlier one.
-	txnID, err := newTxnID()
-	if err != nil {
-		return notify.Retry(0, err, notify.DefaultReason)
-	}
+	// The transaction id is the same for the retries of one notification, so
+	// that a homeserver which already stored the event does not post it
+	// again, and differs between notifications, which a homeserver would
+	// otherwise drop as duplicates.
+	now, _ := notify.Now(ctx)
+	txnID := newTxnID(key, now, roomID, msg)
 
-	var payload bytes.Buffer
-	enc := json.NewEncoder(&payload)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(msg); err != nil {
+	payload, err := encodeContent(msg, logger)
+	if err != nil {
 		return notify.Unrecoverable(err, notify.DefaultReason)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, n.sendURL(roomID, txnID), &payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, n.sendURL(roomID, txnID), payload)
 	if err != nil {
 		return notify.Unrecoverable(notify.RedactURL(err), notify.DefaultReason)
 	}
@@ -196,12 +196,37 @@ func (n *Notifier) sendURL(roomID, txnID string) string {
 		"/send/m.room.message/" + url.PathEscape(txnID)
 }
 
-func newTxnID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("generate transaction id: %w", err)
+// encodeContent encodes the message. A message whose encoded form exceeds
+// maxContentBytes loses its HTML body first, then the plain text body is cut
+// until the content fits.
+func encodeContent(msg message, logger *slog.Logger) (*bytes.Buffer, error) {
+	for {
+		var payload bytes.Buffer
+		enc := json.NewEncoder(&payload)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(msg); err != nil {
+			return nil, err
+		}
+		if payload.Len() <= maxContentBytes {
+			return &payload, nil
+		}
+
+		if msg.FormattedBody != "" {
+			logger.Warn("HTML message too long once encoded, sending the plain text message only", "max_bytes", maxContentBytes)
+			msg.Format = ""
+			msg.FormattedBody = ""
+			continue
+		}
+		logger.Warn("Truncated message to fit the encoded size limit", "max_bytes", maxContentBytes)
+		msg.Body, _ = notify.TruncateInBytes(msg.Body, len(msg.Body)/2)
 	}
-	return "alertmanager-" + hex.EncodeToString(b), nil
+}
+
+// newTxnID derives the transaction id from what identifies a notification.
+func newTxnID(key notify.Key, now time.Time, roomID string, msg message) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%d\x00%s\x00%s\x00%s", key, now.UnixNano(), roomID, msg.Body, msg.FormattedBody)
+	return "alertmanager-" + hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // retryAfter is the delay a rate limited response asks for: the Retry-After
